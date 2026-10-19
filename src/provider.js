@@ -7,6 +7,9 @@ export function createIdentityServer(config, { Adapter, testTtl } = {}) {
   if (!config || !Adapter) throw new Error('Enabled configuration and persistent adapter required');
   if (config.production && testTtl) throw new Error('Test TTL override forbidden in production');
   const bridge = accountBridge(config);
+  // Browsers apply form-action to the logout/resume redirect chain, including the client callback.
+  const callbackOrigins = [...new Set(config.clients.flatMap(client => [...(client.redirect_uris || []), ...(client.post_logout_redirect_uris || [])]).map(uri => new URL(uri)).filter(url => ['http:','https:'].includes(url.protocol)).map(url => url.origin))];
+  const formAction = ["'self'", ...callbackOrigins].join(' ');
   const provider = new Provider(config.issuer, {
     adapter: Adapter, jwks: config.jwks, clients: config.clients,
     responseTypes: ['code'], scopes: ['openid','profile','email','phone'],
@@ -16,7 +19,27 @@ export function createIdentityServer(config, { Adapter, testTtl } = {}) {
     features: { devInteractions: {enabled:false}, registration: {enabled:false}, requestObjects: {enabled:false}, userinfo: {enabled:true} },
     ttl: { AccessToken: testTtl || 600, IdToken: 600, AuthorizationCode: 60, Interaction: 300, Session: 604800, Grant: 604800 },
     interactions: { url: (_ctx, interaction) => `/interaction/${interaction.uid}` },
-    async renderError(ctx) { ctx.type = 'text'; ctx.body = 'Identity request could not be completed'; },
+    async renderError(ctx, out, error) {
+      // Emit only fixed vocabulary: errors can otherwise contain credentials or identifiers.
+      const classes = new Set(['Error','TypeError','SessionNotFound','InvalidRequest','InvalidClient','AccessDenied','LoginRequired','ConsentRequired']);
+      const codes = new Set(['server_error','invalid_request','invalid_client','access_denied','login_required','consent_required']);
+      const routes = new Set(['authorization','resume','end_session','end_session_confirm','token','userinfo']);
+      const reasons = new Map([
+        ['authorization request has expired','resume_cookie_missing'],
+        ['interaction session not found','interaction_missing'],
+        ['authorization session and cookie identifier mismatch','resume_cookie_mismatch'],
+        ['interaction session and authentication session mismatch','session_mismatch'],
+        ['accountId mismatch','grant_account_mismatch'],
+        ['clientId mismatch','grant_client_mismatch'],
+        ['could not find logout details','logout_state_missing'],
+        ['xsrf token invalid','logout_csrf_invalid'],
+        ['Account verification failed','account_bridge_rejected'],
+        ['Invalid account response','account_bridge_invalid_response'],
+        ['fetch failed','account_bridge_unreachable'],
+      ]);
+      console.error(JSON.stringify({event:'identity_protocol_error',errorClass:classes.has(error?.constructor?.name)?error.constructor.name:'other',code:codes.has(out?.error)?out.error:'other',route:routes.has(ctx.oidc?.route)?ctx.oidc.route:'other',reason:reasons.get(error?.error_description)||reasons.get(error?.message)||'other'}));
+      ctx.type = 'text'; ctx.body = 'Identity request could not be completed';
+    },
     async findAccount(_ctx, sub) {
       let account;
       try { account = await bridge.account(sub); } catch { return undefined; }
@@ -49,7 +72,8 @@ export function createIdentityServer(config, { Adapter, testTtl } = {}) {
     res.setHeader('Cache-Control','no-store');
     res.setHeader('Referrer-Policy','no-referrer');
     res.setHeader('X-Content-Type-Options','nosniff');
-    res.setHeader('Content-Security-Policy',"default-src 'none'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'");
+    // oidc-provider appends an exact script hash only when script-src is present.
+    res.setHeader('Content-Security-Policy',`default-src 'none'; script-src 'none'; form-action ${formAction}; frame-ancestors 'none'; base-uri 'none'`);
     const path = new URL(req.url,config.issuer).pathname;
     const match = /^\/interaction\/([^/]+)(?:\/(context|register))?$/.exec(path);
     if (!match) return protocol(req,res);
