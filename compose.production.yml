@@ -1,0 +1,57 @@
+name: ragent-identity
+services:
+  identity:
+    image: ${IDENTITY_IMAGE:-ragent-identity:production-candidate}
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    init: true
+    user: "1000:1000"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    pids_limit: 128
+    mem_limit: 512m
+    cpus: 1.0
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=16m,mode=1777
+    ports:
+      - "127.0.0.1:${IDENTITY_PUBLISH_PORT:-8020}:8020"
+    environment:
+      NODE_ENV: production
+      IDENTITY_ENABLED: ${IDENTITY_ENABLED:-false}
+      IDENTITY_BIND_HOST: 0.0.0.0
+      IDENTITY_PORT: "8020"
+      IDENTITY_ISSUER: ${IDENTITY_ISSUER:?Set exact HTTPS issuer}
+      IDENTITY_ACCOUNT_BASE_URL: ${IDENTITY_ACCOUNT_BASE_URL:?Set HTTPS private account bridge URL}
+      IDENTITY_INTERACTION_UI_PATH: /identity-login
+      CLOUDBASE_ENV_ID: ${CLOUDBASE_ENV_ID:-}
+      IDENTITY_SERVICE_TOKEN_FILE: /run/identity-secrets/service-token
+      IDENTITY_COOKIE_KEYS_FILE: /run/identity-secrets/cookie-keys.json
+      IDENTITY_JWKS_FILE: /run/identity-secrets/private-jwks.json
+      IDENTITY_CLIENTS_FILE: /run/identity-secrets/clients.json
+      IDENTITY_DATABASE_URL_FILE: /run/identity-secrets/database-url
+    volumes:
+      - type: bind
+        source: ${IDENTITY_SECRET_DIR:?Set absolute external secret directory}
+        target: /run/identity-secrets
+        read_only: true
+    extra_hosts:
+      - "${IDENTITY_BRIDGE_HOST:?Set bridge DNS hostname}:${IDENTITY_BRIDGE_GATEWAY:?Set inspected gateway IP or host-gateway}"
+    networks: [account_database]
+    healthcheck:
+      test: [CMD, node, scripts/healthcheck.js]
+      interval: 30s
+      timeout: 5s
+      start_period: 15s
+      retries: 3
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+networks:
+  account_database:
+    external: true
+    name: ${IDENTITY_DOCKER_NETWORK:?Set existing private PostgreSQL network}

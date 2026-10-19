@@ -1,0 +1,25 @@
+{
+  "issuer": "https://auth.example.invalid",
+  "frontend_origin": "https://app.example.invalid",
+  "account_base_url": "https://api.example.invalid",
+  "cloudbase_env_id": "replace-with-environment-id",
+  "database_host": "database.example.invalid",
+  "database_port": 5432,
+  "database_name": "identity_example",
+  "database_role": "identity_runtime",
+  "docker_network": "example-private-network",
+  "bridge_gateway": "192.0.2.1",
+  "trusted_bridge_cidrs": ["192.0.2.0/24"],
+  "secret_dir": "/etc/example-identity/secrets",
+  "certificate_dir": "/etc/letsencrypt/live/auth.example.invalid",
+  "webroot": "/var/www/example-acme",
+  "ca_bundle": "/etc/ssl/certs/ca-certificates.crt",
+  "frontend_snippet": "/etc/nginx/snippets/example-identity-frontend.conf",
+  "identity_upstream": "http://127.0.0.1:8020",
+  "bridge_upstream": "http://127.0.0.1:8010",
+  "image": "example-identity:reviewed-commit",
+  "apps": [
+    {"client_id": "web", "kind": "ragent", "origin": "https://app.example.invalid", "redirect_uri": "https://app.example.invalid/api/auth/oidc/callback"},
+    {"client_id": "review", "kind": "mt", "origin": "https://review.example.invalid", "redirect_uri": "https://review.example.invalid/api/auth/oidc/callback"}
+  ]
+}
