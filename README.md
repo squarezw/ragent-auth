@@ -15,7 +15,7 @@ All environment-specific hosts, callback origins, database targets, network ACLs
 
 Run `npm ci --ignore-scripts && npm test` from this repository root. Build with `docker build -t ragent-auth:local .`. The build context is this root, including when checked out as the backend submodule. Deployment tooling is under [`deploy/identity`](deploy/identity/README.md); see [extraction decisions](docs/extraction.md) and [production packaging](PRODUCTION.md).
 
-CI tests the service and offline deployment generator, then builds the image. It does not publish images, change production or require production secrets. The current production image remains a separately deployed server-local image until an operator performs the next release.
+Feature/fix PRs target `dev`; stable source is promoted from `dev` into `main`. PR and feature-branch CI test the service and deployment tooling without production credentials. After external registry/deployment configuration is enabled, successful `dev` pushes publish immutable images and deploy the configured authentication service; `main` does not deploy. See [CI/CD configuration and rollback](deploy/CI-CD.md). Merely adding this workflow does not provision credentials or infrastructure.
 
 
 Standalone, disabled-by-default OIDC service. The client integration reuses the existing RAgent login UI through a same-origin interaction route. This repository does not deploy a service, register production clients, or migrate MT business users automatically. Without an interaction UI path the minimal protocol-test form remains available for development.
