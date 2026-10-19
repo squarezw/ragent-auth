@@ -14,7 +14,7 @@ class MemoryAdapter {
   async findByUid(uid){for(const [k,v] of MemoryAdapter.records)if(k.startsWith(this.name)&&v.payload.uid===uid&&v.exp>Date.now())return structuredClone(v.payload);}
   async consume(id){const r=MemoryAdapter.records.get(this.name+id);if(!r||r.payload.consumed)throw Error('consumed');r.payload.consumed=Math.floor(Date.now()/1000);}
   async destroy(id){MemoryAdapter.records.delete(this.name+id);}
-  async revokeByGrantId(id){for(const [k,v] of MemoryAdapter.records)if(v.payload.grantId===id)MemoryAdapter.records.delete(k);}
+  async revokeByGrantId(id){for(const [k,v] of MemoryAdapter.records)if(k.startsWith(this.name)&&v.payload.grantId===id)MemoryAdapter.records.delete(k);}
 }
 const listen=server=>new Promise(resolve=>server.listen(0,'127.0.0.1',()=>resolve(`http://127.0.0.1:${server.address().port}`)));
 const close=server=>new Promise(resolve=>server.close(resolve));
@@ -27,6 +27,8 @@ test('configuration defaults closed and enforces exact confidential code clients
 for (const testTtl of [undefined, 1]) test(`real OIDC protocol; ${testTtl ? 'short test override' : 'default ten-minute tokens'}`,async(t)=>{
  MemoryAdapter.records.clear();
  let disabled=false,passwordLogins=0,phoneLogins=0;
+ const switchedSub='bcdf17a0-c93e-4ff7-9797-a0fedb0c6183';
+ let selectedSub=sub;
  const serviceToken='bridge-service-token-for-fixtures-only-123456';
  const backend=createServer(async(req,res)=>{
   assert.equal(req.headers.authorization,`Bearer ${serviceToken}`);
@@ -34,11 +36,12 @@ for (const testTtl of [undefined, 1]) test(`real OIDC protocol; ${testTtl ? 'sho
   let raw='';for await(const chunk of req)raw+=chunk;
   const body=raw?JSON.parse(raw):{};
   if(disabled){res.writeHead(403);return res.end('{}');}
-  if(req.url.endsWith('authenticate-password')){passwordLogins++;if(body.username!=='alice'||body.password!=='valid-password'){res.writeHead(401);return res.end('{}');}}
+  if(req.url.endsWith('authenticate-password')){passwordLogins++;if(!['alice','square'].includes(body.username)||body.password!=='valid-password'){res.writeHead(401);return res.end('{}');}selectedSub=body.username==='square'?switchedSub:sub;}
   else if(req.url.endsWith('authenticate-phone')){phoneLogins++;if(body.access_token!=='verified-phone'){res.writeHead(401);return res.end('{}');}}
   else if(req.url.endsWith('register-phone')){if(body.username!=='new_user'||body.password!=='123456'||body.access_token!=='verified-phone'){res.writeHead(400);return res.end('{}');}}
-  else if(req.url!==`/api/v1/identity/accounts/${sub}`){res.writeHead(404);return res.end('{}');}
-  res.end(JSON.stringify({sub,ragent_user_id:42,cloudbase_uid:'trusted-cloud',cloudbase_env:'test-env',username:'alice',phone:'+8613800000000',email:null,tenant_status:'pending'}));
+  else if(![sub,switchedSub].some(id=>req.url===`/api/v1/identity/accounts/${id}`)){res.writeHead(404);return res.end('{}');}
+  const responseSub=req.url.includes('/accounts/')?req.url.split('/').pop():selectedSub;
+  res.end(JSON.stringify({sub:responseSub,ragent_user_id:42,cloudbase_uid:'trusted-cloud',cloudbase_env:'test-env',username:'alice',phone:'+8613800000000',email:null,tenant_status:'pending'}));
  });
  const bridge=await listen(backend);t.after(()=>close(backend));
  const {privateKey,publicKey}=generateKeyPairSync('rsa',{modulusLength:2048});
@@ -53,13 +56,32 @@ for (const testTtl of [undefined, 1]) test(`real OIDC protocol; ${testTtl ? 'sho
  const browser=jarFetch(cookie=>sessionCookies.push(cookie));
  const verifier=randomBytes(32).toString('base64url');const challenge=createHash('sha256').update(verifier).digest('base64url');
  function authUrl(client='review',extra={}){return issuer+'/auth?'+new URLSearchParams({client_id:client,redirect_uri:`https://${client}.example/callback`,response_type:'code',scope:'openid profile phone',state:'fixture-state',nonce:'fixture-nonce',code_challenge:challenge,code_challenge_method:'S256',...extra});}
- async function authorize(browser,client='review',credentials={username:'alice',password:'valid-password'}){
-  let url=authUrl(client);let logins=0;
+ async function authorize(browser,client='review',credentials={username:'alice',password:'valid-password'},extra={}){
+  let url=authUrl(client,extra);let logins=0;
   for(let i=0;i<12;i++){
    const r=await browser(url);
    const location=r.headers.get('location');
    if(location){if(location.startsWith('https://')){const u=new URL(location);assert.equal(u.searchParams.get('state'),'fixture-state');assert.ok(u.searchParams.get('code'),location);return {code:u.searchParams.get('code'),logins};}url=new URL(location,issuer).href;continue;}
-   const html=await r.text();assert.equal(r.status,200,html);
+   const html=await r.text();assert.equal(r.status,200,url+' '+html);
+   if (html.includes('<title>Submitting Callback</title>')) {
+    const script=/<script>([\s\S]*?)<\/script>/.exec(html)?.[1];
+    assert.ok(script);
+    const digest=createHash('sha256').update(script).digest('base64');
+    const csp=r.headers.get('content-security-policy');
+    assert.ok(csp?.includes("'sha256-"+digest+"'"),'account switch auto-submit must be allowed by an exact CSP hash');
+    assert.ok(!csp.includes("'unsafe-inline'"));
+    assert.match(csp,/default-src 'none'/);
+    assert.match(csp,/form-action 'self'/);
+    const formSources=csp.split(';').find(value=>value.trim().startsWith('form-action')).trim().split(/\s+/).slice(1);
+    assert.deepEqual(new Set(formSources),new Set(["'self'",'https://review.example','https://convert.example']));
+    assert.ok(!formSources.includes('*'));
+    assert.ok(!formSources.includes('https://evil.example'));
+    const action=/<form method="post" action="([^"]+)"/.exec(html)[1];
+    const fields=[...html.matchAll(/<input type="hidden" name="([^"]+)" value="([^"]*)"/g)].map(m=>[m[1],m[2]]);
+    const logout=await browser(new URL(action,issuer),{method:'POST',headers:{origin:issuer,'content-type':'application/x-www-form-urlencoded'},body:new URLSearchParams(fields)});
+    assert.equal(logout.status,303,await logout.clone().text());
+    url=new URL(logout.headers.get('location'),issuer).href;continue;
+   }
    const csrf=/name="csrf" value="([^"]+)"/.exec(html)?.[1];assert.ok(csrf,html);
    const post=await browser(url,{method:'POST',headers:{origin:issuer,'content-type':'application/x-www-form-urlencoded'},body:new URLSearchParams({csrf,...credentials})});
    assert.equal(post.status,303,await post.clone().text());logins++;url=new URL(post.headers.get('location'),issuer).href;
@@ -155,6 +177,34 @@ for (const testTtl of [undefined, 1]) test(`real OIDC protocol; ${testTtl ? 'sho
  let resume=await registrationBrowser(new URL(registrationBody.redirectTo,issuer));
  for(let i=0;i<5&&resume.headers.get('location')&&!resume.headers.get('location').startsWith('https://');i++)resume=await registrationBrowser(new URL(resume.headers.get('location'),issuer));
  assert.ok(resume.headers.get('location')?.includes('code='));
+ const beforeSwitch=await authorize(browser);
+ const beforeSwitchResponse=await token(beforeSwitch.code);assert.equal(beforeSwitchResponse.status,200);
+ const beforeSwitchTokens=await beforeSwitchResponse.json();
+ const switched=await authorize(browser,'review',{username:'square',password:'valid-password'},{prompt:'login'});
+ assert.equal(switched.logins,1);
+ const revokedOldInfo=await fetch(issuer+'/me',{headers:{authorization:`Bearer ${beforeSwitchTokens.access_token}`}});assert.equal(revokedOldInfo.status,401,'switching accounts revokes old session tokens');
+ const switchedTokenResponse=await token(switched.code);assert.equal(switchedTokenResponse.status,200);
+ const switchedTokens=await switchedTokenResponse.json();
+ const switchedId=await jwtVerify(switchedTokens.id_token,await importJWK(publicKey.export({format:'jwk'}),'RS256'),{issuer,audience:'review'});
+ assert.equal(switchedId.payload.sub,switchedSub,'forced login uses new account, not previous session');
+ const switchedInfo=await fetch(issuer+'/me',{headers:{authorization:`Bearer ${switchedTokens.access_token}`}});assert.equal((await switchedInfo.json()).sub,switchedSub);
+ const switchedSilent=await browser(authUrl('convert',{prompt:'none'}));assert.ok(switchedSilent.headers.get('location')?.includes('code='));
+ const switchedSecond=await token(new URL(switchedSilent.headers.get('location')).searchParams.get('code'),'convert');assert.equal(switchedSecond.status,200);
+ const switchedSecondId=await jwtVerify((await switchedSecond.json()).id_token,await importJWK(publicKey.export({format:'jwk'}),'RS256'),{issuer,audience:'convert'});assert.equal(switchedSecondId.payload.sub,switchedSub);
+ // Exercise repeated switches, same-account forced login and both first-party clients.
+ for (const [username,client] of [['alice','review'],['square','convert'],['alice','convert'],['alice','review'],['square','review'],['square','convert'],['alice','review']]) {
+  const expectedSub=username==='square'?switchedSub:sub;
+  const next=await authorize(browser,client,{username,password:'valid-password'},{prompt:'login'});assert.equal(next.logins,1);
+  const response=await token(next.code,client);assert.equal(response.status,200);
+  const nextTokens=await response.json();
+  const nextId=await jwtVerify(nextTokens.id_token,await importJWK(publicKey.export({format:'jwk'}),'RS256'),{issuer,audience:client});assert.equal(nextId.payload.sub,expectedSub);
+  const nextInfo=await fetch(issuer+'/me',{headers:{authorization:`Bearer ${nextTokens.access_token}`}});assert.equal(nextInfo.status,200);assert.equal((await nextInfo.json()).sub,expectedSub);
+  for(const otherClient of ['review','convert']) {
+   const sso=await browser(authUrl(otherClient,{prompt:'none'}));assert.ok(sso.headers.get('location')?.includes('code='));
+   const ssoResponse=await token(new URL(sso.headers.get('location')).searchParams.get('code'),otherClient);assert.equal(ssoResponse.status,200);
+   const ssoId=await jwtVerify((await ssoResponse.json()).id_token,await importJWK(publicKey.export({format:'jwk'}),'RS256'),{issuer,audience:otherClient});assert.equal(ssoId.payload.sub,expectedSub);
+  }
+ }
  const disableBeforeExchange=await authorize(browser);
  disabled=true;
  if (!storage) for (const [key,value] of MemoryAdapter.records) if (key.startsWith('Grant')) value.exp=Date.now()-1;

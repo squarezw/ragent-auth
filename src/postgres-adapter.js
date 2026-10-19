@@ -19,7 +19,8 @@ export async function postgresAdapter(url) {
       if (!result.rowCount) throw new Error('Artifact expired or consumed');
     }
     async destroy(id) { await pool.query('DELETE FROM identity_oidc.artifacts WHERE model=$1 AND id=$2',[this.name,id]); }
-    async revokeByGrantId(id) { await pool.query("DELETE FROM identity_oidc.artifacts WHERE payload->>'grantId'=$1",[id]); }
+    // Revocation is called per token model; pending interactions must survive account switching.
+    async revokeByGrantId(id) { await pool.query("DELETE FROM identity_oidc.artifacts WHERE model=$1 AND payload->>'grantId'=$2",[this.name,id]); }
   }
   return { Adapter, close: async () => {clearInterval(cleanup); await pool.end();} };
 }
