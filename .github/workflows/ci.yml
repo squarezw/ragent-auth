@@ -49,7 +49,7 @@ jobs:
       contents: read
       packages: write
     outputs:
-      image: ${{ steps.image.outputs.reference }}
+      digest: ${{ steps.image.outputs.digest }}
     steps:
       - uses: actions/checkout@v4
       - name: Validate registry configuration
@@ -65,7 +65,7 @@ jobs:
       - uses: docker/login-action@v3
         with:
           registry: ${{ vars.AUTH_REGISTRY }}
-          username: ${{ secrets.REGISTRY_USERNAME || github.actor }}
+          username: ${{ vars.REGISTRY_USERNAME || secrets.REGISTRY_USERNAME || github.actor }}
           password: ${{ secrets.REGISTRY_TOKEN || (vars.AUTH_REGISTRY == 'ghcr.io' && github.token) }}
       - uses: docker/build-push-action@v6
         id: build
@@ -77,9 +77,10 @@ jobs:
           labels: org.opencontainers.image.revision=${{ github.sha }}
       - id: image
         env:
-          IMAGE_NAME: ${{ steps.config.outputs.name }}
           DIGEST: ${{ steps.build.outputs.digest }}
-        run: echo "reference=$IMAGE_NAME@$DIGEST" >> "$GITHUB_OUTPUT"
+        run: |
+          [[ "$DIGEST" =~ ^sha256:[a-f0-9]{64}$ ]] || exit 1
+          echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
   deploy:
     if: github.event_name == 'push' && github.ref == 'refs/heads/dev'
     needs: publish
@@ -107,12 +108,18 @@ jobs:
           AUTH_DEPLOY_HOST: ${{ secrets.AUTH_DEPLOY_HOST }}
           AUTH_DEPLOY_USER: ${{ secrets.AUTH_DEPLOY_USER }}
           AUTH_DEPLOY_PORT: ${{ secrets.AUTH_DEPLOY_PORT || '22' }}
-          IMAGE: ${{ needs.publish.outputs.image }}
+          AUTH_REGISTRY: ${{ vars.AUTH_REGISTRY }}
+          AUTH_IMAGE: ${{ vars.AUTH_IMAGE }}
+          DIGEST: ${{ needs.publish.outputs.digest }}
         run: |
           set -euo pipefail
           [[ "$AUTH_DEPLOY_HOST" =~ ^[a-zA-Z0-9][a-zA-Z0-9.-]*$ ]] || exit 1
           [[ "$AUTH_DEPLOY_USER" =~ ^[a-zA-Z_][a-zA-Z0-9_-]*$ ]] || exit 1
           [[ "$AUTH_DEPLOY_PORT" =~ ^[0-9]+$ ]] && ((AUTH_DEPLOY_PORT > 0 && AUTH_DEPLOY_PORT < 65536)) || exit 1
+          [[ "$AUTH_REGISTRY" =~ ^[a-z0-9][a-z0-9.-]*(:[0-9]+)?$ ]] || exit 1
+          [[ "$AUTH_IMAGE" =~ ^[a-z0-9][a-z0-9._/-]*$ ]] || exit 1
+          [[ "$DIGEST" =~ ^sha256:[a-f0-9]{64}$ ]] || exit 1
+          IMAGE="$AUTH_REGISTRY/$AUTH_IMAGE@$DIGEST"
           [[ "$IMAGE" =~ ^[a-z0-9][a-z0-9./:_-]*@sha256:[a-f0-9]{64}$ ]] || exit 1
           test -n "$AUTH_DEPLOY_KEY" && test -n "$AUTH_DEPLOY_KNOWN_HOSTS"
           umask 077
