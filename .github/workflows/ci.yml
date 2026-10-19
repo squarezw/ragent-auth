@@ -1,11 +1,30 @@
-name: CI
+name: CI and dev deployment
 on:
-  push:
   pull_request:
+    branches: [dev, main]
+  push:
+    branches: ['**']
 permissions:
   contents: read
 jobs:
-  test-and-build:
+  branch-policy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Enforce promotion direction
+        if: github.event_name == 'pull_request'
+        env:
+          BASE: ${{ github.base_ref }}
+          HEAD: ${{ github.head_ref }}
+          SOURCE_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          TARGET_REPO: ${{ github.repository }}
+        run: |
+          if [ "$BASE" = main ]; then
+            [ "$HEAD" = dev ] && [ "$SOURCE_REPO" = "$TARGET_REPO" ] || { echo 'Promote main only from this repository dev branch'; exit 1; }
+          elif [ "$BASE" = dev ]; then
+            [ "$HEAD" != main ] || { echo 'Reverse main to dev merges are not supported'; exit 1; }
+          fi
+  test:
+    needs: branch-policy
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -20,4 +39,93 @@ jobs:
           python-version: '3.12'
       - run: python -m pip install -r deploy/identity/requirements.txt
       - run: python -m unittest discover -s deploy/identity -p 'test_*.py'
-      - run: docker build -t ragent-auth:ci .
+      - run: python -m unittest discover -s deploy -p 'test_cicd.py'
+      - run: docker build -t identity-ci:local .
+  publish:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/dev'
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      digest: ${{ steps.image.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate registry configuration
+        id: config
+        env:
+          AUTH_REGISTRY: ${{ vars.AUTH_REGISTRY }}
+          AUTH_IMAGE: ${{ vars.AUTH_IMAGE }}
+        run: |
+          [[ "$AUTH_REGISTRY" =~ ^[a-z0-9][a-z0-9.-]*(:[0-9]+)?$ ]] || exit 1
+          [[ "$AUTH_IMAGE" =~ ^[a-z0-9][a-z0-9._/-]*$ ]] || exit 1
+          echo "name=$AUTH_REGISTRY/$AUTH_IMAGE" >> "$GITHUB_OUTPUT"
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ vars.AUTH_REGISTRY }}
+          username: ${{ vars.REGISTRY_USERNAME || secrets.REGISTRY_USERNAME || github.actor }}
+          password: ${{ secrets.REGISTRY_TOKEN || (vars.AUTH_REGISTRY == 'ghcr.io' && github.token) }}
+      - uses: docker/build-push-action@v6
+        id: build
+        with:
+          context: .
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.config.outputs.name }}:${{ github.sha }}
+          labels: org.opencontainers.image.revision=${{ github.sha }}
+      - id: image
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          [[ "$DIGEST" =~ ^sha256:[a-f0-9]{64}$ ]] || exit 1
+          echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
+  deploy:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/dev'
+    needs: publish
+    runs-on: ubuntu-latest
+    environment: auth-dev
+    concurrency:
+      group: auth-dev-deployment
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+      - name: Skip superseded dev commits
+        id: current
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const branch = await github.rest.repos.getBranch({
+              owner: context.repo.owner, repo: context.repo.repo, branch: 'dev'
+            });
+            core.setOutput('deploy', String(branch.data.commit.sha === context.sha));
+      - name: Deploy only existing identity service
+        if: steps.current.outputs.deploy == 'true'
+        env:
+          AUTH_DEPLOY_KEY: ${{ secrets.AUTH_DEPLOY_KEY }}
+          AUTH_DEPLOY_KNOWN_HOSTS: ${{ secrets.AUTH_DEPLOY_KNOWN_HOSTS }}
+          AUTH_DEPLOY_HOST: ${{ secrets.AUTH_DEPLOY_HOST }}
+          AUTH_DEPLOY_USER: ${{ secrets.AUTH_DEPLOY_USER }}
+          AUTH_DEPLOY_PORT: ${{ secrets.AUTH_DEPLOY_PORT || '22' }}
+          AUTH_REGISTRY: ${{ vars.AUTH_REGISTRY }}
+          AUTH_IMAGE: ${{ vars.AUTH_IMAGE }}
+          DIGEST: ${{ needs.publish.outputs.digest }}
+        run: |
+          set -euo pipefail
+          [[ "$AUTH_DEPLOY_HOST" =~ ^[a-zA-Z0-9][a-zA-Z0-9.-]*$ ]] || exit 1
+          [[ "$AUTH_DEPLOY_USER" =~ ^[a-zA-Z_][a-zA-Z0-9_-]*$ ]] || exit 1
+          [[ "$AUTH_DEPLOY_PORT" =~ ^[0-9]+$ ]] && ((AUTH_DEPLOY_PORT > 0 && AUTH_DEPLOY_PORT < 65536)) || exit 1
+          [[ "$AUTH_REGISTRY" =~ ^[a-z0-9][a-z0-9.-]*(:[0-9]+)?$ ]] || exit 1
+          [[ "$AUTH_IMAGE" =~ ^[a-z0-9][a-z0-9._/-]*$ ]] || exit 1
+          [[ "$DIGEST" =~ ^sha256:[a-f0-9]{64}$ ]] || exit 1
+          IMAGE="$AUTH_REGISTRY/$AUTH_IMAGE@$DIGEST"
+          [[ "$IMAGE" =~ ^[a-z0-9][a-z0-9./:_-]*@sha256:[a-f0-9]{64}$ ]] || exit 1
+          test -n "$AUTH_DEPLOY_KEY" && test -n "$AUTH_DEPLOY_KNOWN_HOSTS"
+          umask 077
+          key=$(mktemp)
+          hosts=$(mktemp)
+          trap 'rm -f "$key" "$hosts"' EXIT
+          printf '%s\n' "$AUTH_DEPLOY_KEY" > "$key"
+          printf '%s\n' "$AUTH_DEPLOY_KNOWN_HOSTS" > "$hosts"
+          ssh -i "$key" -p "$AUTH_DEPLOY_PORT" -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o "UserKnownHostsFile=$hosts" "$AUTH_DEPLOY_USER@$AUTH_DEPLOY_HOST" "auth-deploy $IMAGE"
