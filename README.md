@@ -11,7 +11,7 @@ All environment-specific hosts, callback origins, database targets, network ACLs
 - This repository owns OIDC protocol handling, protocol persistence/migration, issuer configuration, Docker packaging, deployment templates and tests.
 - `ragent-service` remains the account authority: password/SMS validation, phone registration, stable subject mapping, tenant membership and business permissions stay behind its authenticated account bridge. No user data or production credentials are copied here.
 - RAgent owns the current `/identity-login` presentation and each application owns its callback/session. The issuer reaches that UI through the existing same-origin reverse proxy; this extraction does not introduce a new login design.
-- `ragent-service/identity-provider` consumes this repository as a Git submodule pinned to an exact commit. After cloning the backend, run `git submodule update --init identity-provider`; update the pointer only through a reviewed backend change. Runtime integration is HTTPS/OIDC, not an npm import or a Python package dependency.
+- Run and build the issuer directly from this standalone checkout. This is the recommended local runtime path. Older backend revisions may still contain a pinned source submodule; that source pin does not determine which runtime is started. Runtime integration uses HTTP on explicitly configured local loopback development endpoints and HTTPS in production; it is not an npm import or a Python package dependency. The account bridge remains a separately operated backend dependency.
 
 Run `npm ci --ignore-scripts && npm test` from this repository root. Build with `docker build -t ragent-auth:local .`. The build context is this root, including when checked out as the backend submodule. Deployment tooling is under [`deploy/identity`](deploy/identity/README.md); see [extraction decisions](docs/extraction.md) and [production packaging](PRODUCTION.md).
 
@@ -82,3 +82,35 @@ See [PRODUCTION.md](PRODUCTION.md) for the standalone Docker/Compose candidate, 
 Access-token expiry alone does not end the central SSO session. When an explicitly configured first-party client's stored grant has expired or disappeared while its central session remains valid, the issuer rechecks the active account and creates a replacement grant for that same account/client, limited to `openid profile email phone`. Unknown clients, inactive accounts and missing central sessions remain rejected. Existing grants continue through the provider's account/client consistency checks. This does not implement immediate grant revocation or global sign-out; those require a separate revocation policy.
 
 A production `consent_required` response may indicate a missing grant or scopes not present in an existing grant. Inspect the Session/Grant expiration and scope metadata before attributing it to token expiry. Deleted historical artifacts cannot establish the original failure time.
+
+## Local development from this standalone checkout
+
+Use Node >=22.14.0 and `npm ci --ignore-scripts`, then run:
+
+```bash
+npm run dev:local
+```
+
+This foreground command starts this checkout's issuer on `127.0.0.1:8020` and its development same-origin proxy on `127.0.0.1:8021`. Ctrl+C stops both. It refuses to replace occupied ports. It does not invoke Python or start any `ragent-service` process. Keep the existing account bridge, PostgreSQL, Redis and RAgent frontend running independently; the login UI is proxied to `127.0.0.1:3000`.
+
+Provide operator-owned environment values as a JSON object of string values in ignored `secrets/local/runtime.json` (directory mode `0700`, file mode `0600`), or select another protected file with `IDENTITY_LOCAL_CONFIG`. Use the configuration keys from `.env.example`, with `NODE_ENV=development`, `IDENTITY_ENABLED=true`, `IDENTITY_BIND_HOST=127.0.0.1`, `IDENTITY_PORT=8020`, `IDENTITY_ISSUER=http://127.0.0.1:8021`, and the existing local account bridge URL. Keep independent service/cookie/client secrets, signing keys and exact client callbacks. During a launcher-only migration, securely retain the existing configuration and signing keys rather than generating new identities or sessions. Never commit the protected configuration. This command does not run database migrations.
+
+The local RAgent client must use issuer `http://127.0.0.1:8021` and its registered callback `http://127.0.0.1:3000/api/auth/oidc/callback`. Use `127.0.0.1` consistently. Verify discovery at `http://127.0.0.1:8021/.well-known/openid-configuration` after startup. The proxy intentionally preserves the existing local route layout; it is not a production reverse proxy.
+
+## Local Docker runtime
+
+With Docker and the protected configuration described below, run auth without a source checkout mounted into the container or a host Node process:
+
+```bash
+docker compose -f compose.local.yml up -d --wait
+docker compose -f compose.local.yml ps
+docker compose -f compose.local.yml logs --tail 30
+# Stop auth explicitly:
+docker compose -f compose.local.yml stop
+```
+
+Run these commands from this directory. This development-only Compose pulls an immutable published auth image and `nginx:1.28-alpine`. The auth image targets `linux/amd64`; other hosts need Docker emulation. Select and verify a newer image explicitly when updating. This configuration does not change production deployment.
+
+Both containers use `restart: unless-stopped`. Docker restarts restore running containers; after an explicit stop, use `up -d` to resume. The proxy retains public issuer `http://127.0.0.1:8021`, and protocol listener `8020` is published on loopback only. Stop `dev:local` before switching to Docker because the modes use the same ports.
+
+Provide operator-owned configuration in ignored `secrets/local/docker-runtime.json`, following the keys in `.env.example`. Use `NODE_ENV=development`, `IDENTITY_ENABLED=true`, `IDENTITY_BIND_HOST=0.0.0.0`, `IDENTITY_PORT=8020` and `IDENTITY_ISSUER=http://127.0.0.1:8021`. Configure database and account bridge URLs to reach your dependencies from Docker; use `host.docker.internal` for host listeners. Preserve existing signing keys and client registration when switching launchers. Keep the directory mode `0700` and file mode `0600`, and never commit credentials. The container reads this protected mount at startup then drops to UID/GID 1000 before starting the issuer. Credentials are not put in Compose environment values or image layers. The frontend on port 3000, an authenticated account bridge and its dependencies, and an initialized protocol database must be available independently. These containers do not start or replace them or run migrations. Apply the protocol migration separately using the documented migration command before first use. The proxy exposes only OIDC and necessary public login UI routes; other paths return 404.

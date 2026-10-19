@@ -9,7 +9,8 @@
   "scripts": {
     "start": "node src/main.js",
     "test": "node --test test/*.test.js",
-    "migrate": "node scripts/migrate.js"
+    "migrate": "node scripts/migrate.js",
+    "dev:local": "node scripts/local-runtime.mjs"
   },
   "dependencies": {
     "oidc-provider": "9.12.2",
