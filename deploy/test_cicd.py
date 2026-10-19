@@ -97,6 +97,31 @@ class ReleaseTests(unittest.TestCase):
             link = Path(tmp)/'link'; link.symlink_to(untrusted)
             with self.assertRaises(ValueError): wrapper.protected_regular_file(link)
 
+    def test_publish_boundary_exports_only_validated_digest(self):
+        workflow=(ROOT/'.github/workflows/ci.yml').read_text()
+        self.assertIn('digest: ${{ steps.image.outputs.digest }}', workflow)
+        self.assertNotIn('needs.publish.outputs.image', workflow)
+        self.assertIn('vars.REGISTRY_USERNAME || secrets.REGISTRY_USERNAME || github.actor', workflow)
+        start=workflow.index('      - id: image\n')
+        end=workflow.index('\n  deploy:', start)
+        step=workflow[start:end]
+        self.assertNotIn('IMAGE_NAME', step)
+        self.assertNotIn('AUTH_IMAGE', step)
+        self.assertNotIn('REGISTRY_USERNAME', step)
+        script=step.split('        run: |\n',1)[1]
+        script='\n'.join(line[10:] for line in script.splitlines())
+        with tempfile.TemporaryDirectory() as tmp:
+            output=Path(tmp)/'output'
+            digest='sha256:'+'a'*64
+            result=subprocess.run(['bash','-c',script],env=dict(os.environ,DIGEST=digest,GITHUB_OUTPUT=str(output)),capture_output=True)
+            self.assertEqual(result.returncode,0)
+            self.assertEqual(output.read_text(),'digest='+digest+'\n')
+            for invalid in [IMAGE, 'latest', digest+'\nusername=example']:
+                output.unlink(missing_ok=True)
+                result=subprocess.run(['bash','-c',script],env=dict(os.environ,DIGEST=invalid,GITHUB_OUTPUT=str(output)),capture_output=True)
+                self.assertNotEqual(result.returncode,0)
+                self.assertFalse(output.exists())
+
     def test_workflow_branch_gates_and_no_untrusted_secrets(self):
         workflow=(ROOT/'.github/workflows/ci.yml').read_text()
         self.assertIn('branches: [dev, main]',workflow)
